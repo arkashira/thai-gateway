@@ -247,7 +247,7 @@ APPROVE: The proposed changes address the reviewer's feedback and implement the 
 
 security PASS (findings=0)
 
-## qa — qa @ 2026-06-04T12:56:56.214490Z
+## qa — qa @ 2026-06-04T13:08:24.655746Z
 
 PASS: The task is to add a health‑check endpoint `/health` to the Thai‑Gateway service.  
 Below is a TDD‑style test plan that covers acceptance criteria, unit tests, integration tests, and a risk register.  
