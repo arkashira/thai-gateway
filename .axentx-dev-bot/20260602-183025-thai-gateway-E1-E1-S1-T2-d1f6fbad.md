@@ -210,78 +210,108 @@ Acceptance criteria:
 
 security WARN (findings=4)
 
-## qa — qa @ 2026-06-05T00:47:44.252455Z
+## qa — qa @ 2026-06-05T01:44:29.874814Z
 
-PASS:
+PASS: Test plan for **thai-gateway** – retry logic for quota‑exceeded responses
 
-1. **Acceptance criteria**
-   - The gateway retries with an alternative provider when a quota-exceeded response (HTTP 429) is received.
-   - The retry logic ensures a fallback provider is selected within 200 ms of the initial request.
-   - All retry attempts are logged with the provider ID, timestamp, and the reason for retry.
-   - If all providers are quota-exceeded, the gateway returns a 503 Service Unavailable response.
-   - The retry logic does not exceed 3 attempts for a single request.
+---
 
-2. **Unit tests**
-   ```python
-   import pytest
-   from thai_gateway import Gateway
+### 1. Acceptance Criteria
+1. **Provider selection** – For each incoming request the gateway selects the provider with the lowest current usage percentage (as reported by the provider health endpoint).  
+2. **Quota‑exceeded detection** – If a provider returns HTTP 429 (or a configured “quota‑exceeded” error code), the gateway must treat the response as a failure and trigger a retry.  
+3. **Retry latency** – The retry to an alternative provider must be initiated **within 200 ms** of receiving the quota‑exceeded response.  
+4. **Maximum attempts** – The gateway may attempt at most **3 total attempts** (initial + up to 2 retries).  
+5. **Fallback provider** – On each retry the gateway selects the next‑least‑congested provider that has not already been tried for the current request.  
+6. **Final failure** – If all available providers are quota‑exceeded (or the max‑attempt count is reached), the gateway returns **HTTP 503 Service Unavailable** to the client.  
+7. **Logging** – Every routing decision (initial selection and each retry) is logged with: provider ID, timestamp, current usage %, and outcome (success / quota‑exceeded / other error).
 
-   def test_retry_on_quota_exceeded():
-       gateway = Gateway()
-       mock_provider = MockProvider()
-       mock_provider.set_response(429, "Quota Exceeded")
-       response = gateway.process_request("test_request", [mock_provider])
-       assert response.status_code == 200  # Assuming a successful retry
-       assert mock_provider.call_count == 2  # Initial call + retry
+---
 
-   def test_retry_within_time_limit():
-       start_time = time.time()
-       gateway = Gateway()
-       mock_provider = MockProvider()
-       mock_provider.set_response(429, "Quota Exceeded")
-       response = gateway.process_request("test_request", [mock_provider])
-       end_time = time.time()
-       assert end_time - start_time <= 0.2  # Within 200 ms
+### 2. Unit Tests (Rust – using `tokio::test` + `assert_eq!`)
 
-   def test_log_retry_attempts():
-       gateway = Gateway()
-       mock_provider = MockProvider()
-       mock_provider.set_response(429, "Quota Exceeded")
-       with patch('logging.info') as mock_log:
-           gateway.process_request("test_request", [mock_provider])
-           mock_log.assert_called_with("Retrying with alternative provider due to quota exceeded")
+```rust
+// src/tests/unit_retry.rs
+use super::*;
+use std::sync::{Arc, Mutex};
+use chrono::Utc;
+use mockall::{automock, predicate::*};
 
-   def test_max_retry_attempts():
-       gateway = Gateway()
-       mock_providers = [MockProvider() for _ in range(3)]
-       for provider in mock_providers:
-           provider.set_response(429, "Quota Exceeded")
-       response = gateway.process_request("test_request", mock_providers)
-       assert response.status_code == 503  # Service Unavailable after max retries
+#[automock]
+trait Provider {
+    fn id(&self) -> &str;
+    fn current_usage(&self) -> f64;               // 0.0 – 1.0
+    async fn forward(&self, req: Request) -> Response;
+}
 
-   def test_no_retry_on_successful_response():
-       gateway = Gateway()
-       mock_provider = MockProvider()
-       mock_provider.set_response(200, "Success")
-       response = gateway.process_request("test_request", [mock_provider])
-       assert response.status_code == 200
-       assert mock_provider.call_count == 1  # No retry needed
-   ```
+// Helper to capture logs
+struct LogCapture {
+    entries: Arc<Mutex<Vec<String>>>,
+}
+impl LogCapture {
+    fn new() -> Self {
+        Self { entries: Arc::new(Mutex::new(vec![])) }
+    }
+    fn record(&self, msg: &str) {
+        self.entries.lock().unwrap().push(msg.to_string());
+    }
+    fn contains(&self, substr: &str) -> bool {
+        self.entries.lock().unwrap().iter().any(|s| s.contains(substr))
+    }
+}
 
-3. **Integration tests**
-   - **Happy Path 1:** Request is successfully processed by the first provider.
-   - **Happy Path 2:** Request is successfully retried and processed by the second provider after the first provider returns a quota-exceeded response.
-   - **Happy Path 3:** Request is successfully retried and processed by the third provider after the first two providers return quota-exceeded responses.
-   - **Edge Case 1:** All providers return quota-exceeded responses, and the gateway returns a 503 Service Unavailable response.
-   - **Edge Case 2:** The request processing time exceeds the 200 ms limit due to network latency.
-   - **Edge Case 3:** The gateway logs all retry attempts and the final decision correctly.
+// 1. Successful routing – no quota exceeded
+#[tokio::test]
+async fn test_route_successful() {
+    let mut prov = MockProvider::new();
+    prov.expect_id().return_const("prov-A");
+    prov.expect_current_usage().return_const(0.30);
+    prov.expect_forward()
+        .returning(|_| async { Response::new(200) });
 
-4. **Risk register**
-   - **Risk:** The retry logic might cause an infinite loop if not properly limited.
-     - **Detection:** Monitor the number of retry attempts and ensure it does not exceed 3.
-   - **Risk:** The retry logic might not be fast enough to meet the 200 ms requirement.
-     - **Detection:** Measure the time taken for retry attempts and ensure it is within the specified limit.
-   - **Risk:** The logging mechanism might fail, leading to a lack of visibility into retry attempts.
-     - **Detection:** Regularly check logs to ensure all retry attempts are logged.
-   - **Risk:** The gateway might not handle unexpected responses from providers correctly.
-     - **Detection:** Test with various unexpected responses and ensure the gateway handles them gracefully.
+    let gateway = Gateway::new(vec![Arc::new(prov)], LogCapture::new());
+    let resp = gateway.handle(Request::new()).await;
+    assert_eq!(resp.status(), 200);
+}
+
+// 2. Retry on HTTP 429 and succeed with second provider
+#[tokio::test]
+async fn test_retry_quota_exceeded_success() {
+    // Provider A returns 429
+    let mut prov_a = MockProvider::new();
+    prov_a.expect_id().return_const("prov-A");
+    prov_a.expect_current_usage().return_const(0.20);
+    prov_a.expect_forward()
+        .returning(|_| async { Response::new(429) });
+
+    // Provider B returns 200
+    let mut prov_b = MockProvider::new();
+    prov_b.expect_id().return_const("prov-B");
+    prov_b.expect_current_usage().return_const(0.40);
+    prov_b.expect_forward()
+        .returning(|_| async { Response::new(200) });
+
+    let gateway = Gateway::new(vec![Arc::new(prov_a), Arc::new(prov_b)], LogCapture::new());
+    let resp = gateway.handle(Request::new()).await;
+    assert_eq!(resp.status(), 200);
+}
+
+// 3. Retry latency ≤ 200 ms
+#[tokio::test]
+async fn test_retry_latency() {
+    let mut prov_a = MockProvider::new();
+    prov_a.expect_id().return_const("prov-A");
+    prov_a.expect_current_usage().return_const(0.10);
+    prov_a.expect_forward()
+        .returning(|_| async {
+            // simulate processing time
+            tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
+            Response::new(429)
+        });
+
+    let mut prov_b = MockProvider::new();
+    prov_b.expect_id().return_const("prov-B");
+    prov_b.expect_current_usage().return_const(0.50);
+    prov_b.expect_forward()
+        .returning(|_| async { Response::new(200) });
+
+  
