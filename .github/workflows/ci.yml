@@ -1,0 +1,2 @@
+# Check Prometheus metrics endpoint
+curl http://localhost
